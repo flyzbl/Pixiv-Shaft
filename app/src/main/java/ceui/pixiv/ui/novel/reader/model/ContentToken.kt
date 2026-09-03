@@ -13,6 +13,10 @@ sealed class ContentToken {
         val textSourceStart: Int = sourceStart,
         /** Inline markup spans (links, ruby, etc.) with offsets into [text]. */
         val inlineSpans: List<ceui.pixiv.ui.novel.reader.paginate.InlineSpan> = emptyList(),
+        /** Synthetic translated text: display offsets map proportionally back to the source range. */
+        val isTranslated: Boolean = false,
+        /** Bilingual-mode original line: render with the smaller secondary/caption style. */
+        val isSecondary: Boolean = false,
     ) : ContentToken()
 
     data class Chapter(

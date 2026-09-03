@@ -1,12 +1,17 @@
 package ceui.pixiv.ui.translate
 
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.Observer
 import ceui.lisa.R
 import ceui.lisa.utils.Common
 import ceui.pixiv.ui.novel.reader.model.ContentToken
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -17,8 +22,11 @@ import kotlinx.coroutines.withContext
 import timber.log.Timber
 
 /**
- * Process-level whole-novel translation center. Leaving the reader does not cancel the job.
- * Only explicit cancel or process death stops it.
+ * Process-level whole-novel translation center.
+ *
+ * Translation survives ordinary configuration while the reader view exists, but when the
+ * reader view lifecycle is destroyed (the user leaves that novel), the matching batch is
+ * cancelled silently. Completed paragraphs are persisted and can be resumed next time.
  */
 object NovelBatchTranslateCenter {
 
@@ -43,10 +51,25 @@ object NovelBatchTranslateCenter {
 
     private data class Piece(val paragraphIndex: Int, val pieceIndex: Int, val text: String)
 
+    private class TranslationLiveData(
+        private val translationKey: String,
+    ) : MutableLiveData<Snapshot?>(null) {
+        override fun observe(owner: LifecycleOwner, observer: Observer<in Snapshot?>) {
+            owner.lifecycle.addObserver(
+                LifecycleEventObserver { _, event ->
+                    if (event == Lifecycle.Event.ON_DESTROY) {
+                        NovelBatchTranslateCenter.cancelKey(translationKey, showToast = false)
+                    }
+                },
+            )
+            super.observe(owner, observer)
+        }
+    }
+
     private const val MAX_PIECE_CHARS = 2800
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val buckets = LinkedHashMap<String, MutableLiveData<Snapshot?>>()
+    private val buckets = LinkedHashMap<String, TranslationLiveData>()
     private val preparing = HashSet<String>()
 
     private val _status = MutableLiveData<BatchStatus?>(null)
@@ -54,7 +77,7 @@ object NovelBatchTranslateCenter {
 
     private var job: Job? = null
     private var currentKey: String? = null
-    private var cancelledByUser = false
+    private var jobGeneration: Long = 0L
 
     fun translationsOf(novelId: Long, targetLang: String): LiveData<Snapshot?> =
         bucket(key(novelId, targetLang))
@@ -93,31 +116,44 @@ object NovelBatchTranslateCenter {
         if (job?.isActive == true) return false
         val targetLang = appTranslateTargetLang()
         val key = key(novelId, targetLang)
-        cancelledByUser = false
+        val generation = ++jobGeneration
         currentKey = key
-        job = scope.launch {
+        val newJob = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 runBatch(novelId, title, targetLang, tokens, key)
-            } catch (e: CancellationException) {
-                if (!cancelledByUser) throw e
-                _status.value = _status.value?.copy(running = false)
+            } catch (_: CancellationException) {
+                if (jobGeneration == generation) {
+                    _status.value = _status.value?.copy(running = false)
+                }
             } catch (e: Exception) {
                 Timber.e(e, "NovelBatchTranslateCenter: batch failed")
-                _status.value = _status.value?.copy(running = false)
-                Common.showToast(R.string.novel_translate_failed)
+                if (jobGeneration == generation) {
+                    _status.value = _status.value?.copy(running = false)
+                    Common.showToast(R.string.novel_translate_failed)
+                }
             } finally {
-                currentKey = null
-                job = null
+                // A cancelled previous reader can finish its NonCancellable cache flush after a
+                // new reader has already started. Only the generation that still owns the slot may
+                // clear the shared job/currentKey fields.
+                if (jobGeneration == generation) {
+                    currentKey = null
+                    job = null
+                }
             }
         }
+        job = newJob
+        newJob.start()
         return true
     }
 
     fun cancel(novelId: Long, targetLang: String) {
-        if (!isRunningFor(novelId, targetLang)) return
-        cancelledByUser = true
+        cancelKey(key(novelId, targetLang), showToast = true)
+    }
+
+    private fun cancelKey(key: String, showToast: Boolean) {
+        if (job?.isActive != true || currentKey != key) return
         job?.cancel()
-        Common.showToast(R.string.novel_translate_cancelled)
+        if (showToast) Common.showToast(R.string.novel_translate_cancelled)
     }
 
     private suspend fun runBatch(
@@ -200,7 +236,8 @@ object NovelBatchTranslateCenter {
             Timber.e(e, "NovelBatchTranslateCenter: translateBatch failed")
         } finally {
             // The batch Job may already be cancelled here. Persist through a sibling process
-            // scope and wait non-cancellably so explicit stop still keeps every completed paragraph.
+            // scope and wait non-cancellably so leaving the reader or explicit stop still keeps
+            // every completed paragraph.
             withContext(NonCancellable) {
                 persistChannel.trySend(outputs.toList())
                 persistChannel.close()
@@ -255,6 +292,6 @@ object NovelBatchTranslateCenter {
 
     private fun key(novelId: Long, targetLang: String): String = "$novelId|$targetLang"
 
-    private fun bucket(key: String): MutableLiveData<Snapshot?> =
-        buckets.getOrPut(key) { MutableLiveData(null) }
+    private fun bucket(key: String): TranslationLiveData =
+        buckets.getOrPut(key) { TranslationLiveData(key) }
 }

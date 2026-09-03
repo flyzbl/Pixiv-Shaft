@@ -2,7 +2,9 @@ package ceui.pixiv.ui.novel.reader.ui
 
 import android.view.View
 import android.widget.SeekBar
+import ceui.lisa.R
 import ceui.lisa.databinding.LayoutReaderBottomBarBinding
+import ceui.pixiv.ui.novel.reader.NovelReaderV3ViewModel
 
 class ReaderBottomBar(private val binding: LayoutReaderBottomBarBinding) {
 
@@ -17,12 +19,12 @@ class ReaderBottomBar(private val binding: LayoutReaderBottomBarBinding) {
     var onSettingsClick: (() -> Unit)? = null
     var onThemeToggleClick: (() -> Unit)? = null
     var onSearchClick: (() -> Unit)? = null
+    var onTranslationOriginalClick: (() -> Unit)? = null
+    var onTranslationTranslatedClick: (() -> Unit)? = null
+    var onTranslationBilingualClick: (() -> Unit)? = null
     var onSeekStart: (() -> Unit)? = null
-    /** Paged mode: drag changes — pageIndex 0..total-1. */
     var onSeekChanged: ((pageIndex: Int) -> Unit)? = null
-    /** Paged mode: drag end — pageIndex 0..total-1. */
     var onSeekCommit: ((pageIndex: Int) -> Unit)? = null
-    /** Vertical-scroll mode: drag end — fraction in [0f, 1f]. */
     var onScrollSeekCommit: ((fraction: Float) -> Unit)? = null
 
     private var suppressSeekListener = false
@@ -36,13 +38,14 @@ class ReaderBottomBar(private val binding: LayoutReaderBottomBarBinding) {
         binding.btnSettings.setOnClickListener { onSettingsClick?.invoke() }
         binding.btnThemeToggle.setOnClickListener { onThemeToggleClick?.invoke() }
         binding.btnSearch.setOnClickListener { onSearchClick?.invoke() }
+        binding.btnTranslateOriginal.setOnClickListener { onTranslationOriginalClick?.invoke() }
+        binding.btnTranslateTranslated.setOnClickListener { onTranslationTranslatedClick?.invoke() }
+        binding.btnTranslateBilingual.setOnClickListener { onTranslationBilingualClick?.invoke() }
 
         binding.skProgress.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar, progress: Int, fromUser: Boolean) {
                 if (!fromUser || suppressSeekListener) return
                 if (mode == Mode.Paged) onSeekChanged?.invoke(progress)
-                // VerticalScroll mode emits only on commit — live drag would jitter the
-                // ScrollView and cause re-layout storms.
             }
 
             override fun onStartTrackingTouch(s: SeekBar) {
@@ -71,17 +74,12 @@ class ReaderBottomBar(private val binding: LayoutReaderBottomBarBinding) {
             suppressSeekListener = false
         }
         binding.txtProgress.text = if (totalPages == 0) {
-            binding.root.context.getString(ceui.lisa.R.string.reader_progress_empty)
+            binding.root.context.getString(R.string.reader_progress_empty)
         } else {
-            binding.root.context.getString(ceui.lisa.R.string.reader_progress_format, currentPage + 1, totalPages)
+            binding.root.context.getString(R.string.reader_progress_format, currentPage + 1, totalPages)
         }
     }
 
-    /**
-     * Vertical-scroll mode: keep the seekbar in sync with overall scroll progress.
-     * Uses a fixed [SCROLL_MAX] resolution so a single pixel of drag corresponds
-     * to a sensible fraction even on tall novels. Text shows "NN%".
-     */
     fun setScrollProgress(fraction: Float) {
         mode = Mode.VerticalScroll
         val clamped = fraction.coerceIn(0f, 1f)
@@ -96,20 +94,37 @@ class ReaderBottomBar(private val binding: LayoutReaderBottomBarBinding) {
         binding.txtProgress.text = "$pct%"
     }
 
-    /** 当前小说有所属系列时调用 setSeriesVisible(true)，唤起 SeriesListSheet 切换其它单篇。 */
+    fun setTranslationMode(mode: NovelReaderV3ViewModel.TranslationViewMode) {
+        binding.btnTranslateOriginal.alpha = if (mode == NovelReaderV3ViewModel.TranslationViewMode.Original) 1f else 0.55f
+        binding.btnTranslateTranslated.alpha = if (mode == NovelReaderV3ViewModel.TranslationViewMode.Translated) 1f else 0.55f
+        binding.btnTranslateBilingual.alpha = if (mode == NovelReaderV3ViewModel.TranslationViewMode.Bilingual) 1f else 0.55f
+    }
+
+    fun setTranslationProgress(done: Int, total: Int, running: Boolean) {
+        if (total <= 0) {
+            binding.txtTranslateProgress.visibility = View.GONE
+            return
+        }
+        binding.txtTranslateProgress.visibility = View.VISIBLE
+        binding.txtTranslateProgress.text = binding.root.context.getString(
+            R.string.novel_translate_progress,
+            done.coerceIn(0, total),
+            total,
+        )
+        binding.txtTranslateProgress.alpha = if (running) 1f else 0.72f
+    }
+
     fun setSeriesVisible(visible: Boolean) {
         binding.btnSeries.visibility = if (visible) View.VISIBLE else View.GONE
     }
 
     fun setDarkMode(dark: Boolean) {
         binding.txtThemeToggle.text = binding.root.context.getString(
-            if (dark) ceui.lisa.R.string.reader_btn_theme_day else ceui.lisa.R.string.reader_btn_theme_night,
+            if (dark) R.string.reader_btn_theme_day else R.string.reader_btn_theme_night,
         )
     }
 
     private companion object {
-        // Resolution for the scroll-mode seekbar — fine enough that a 1-pixel
-        // drag of the thumb still produces a meaningful jump on a long novel.
         const val SCROLL_MAX = 1000
     }
 }

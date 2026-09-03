@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="novel_translate_full">翻译全文</string>
+    <string name="novel_translate_stop">停止翻译</string>
+    <string name="novel_translate_view_original">原文</string>
+    <string name="novel_translate_view_translated">译文</string>
+    <string name="novel_translate_view_bilingual">对照</string>
+    <string name="novel_translate_progress">已译 %1$d/%2$d 段</string>
+    <string name="novel_translate_failed">小说翻译失败，可重试未完成段落</string>
+    <string name="novel_translate_cancelled">已停止翻译，可继续</string>
+    <string name="novel_translate_busy">另一篇小说正在翻译</string>
+</resources>

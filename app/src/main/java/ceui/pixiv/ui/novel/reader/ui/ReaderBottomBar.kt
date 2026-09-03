@@ -30,6 +30,16 @@ class ReaderBottomBar(private val binding: LayoutReaderBottomBarBinding) {
     private var suppressSeekListener = false
     private var mode: Mode = Mode.Paged
 
+    /**
+     * Translation controls can become tappable before the novel tokens/cache snapshot have been
+     * prepared. Remember a user's non-original choice and fire the normal Fragment callback as
+     * soon as [setTranslationProgress] confirms there are paragraphs ready to translate.
+     * This makes “译文/对照” the primary translation entry instead of requiring the top-right
+     * “翻译全文” action as a second click.
+     */
+    private var translationReady = false
+    private var pendingTranslationMode: NovelReaderV3ViewModel.TranslationViewMode? = null
+
     init {
         binding.btnPrevChapter.setOnClickListener { onPrevChapter?.invoke() }
         binding.btnNextChapter.setOnClickListener { onNextChapter?.invoke() }
@@ -38,9 +48,17 @@ class ReaderBottomBar(private val binding: LayoutReaderBottomBarBinding) {
         binding.btnSettings.setOnClickListener { onSettingsClick?.invoke() }
         binding.btnThemeToggle.setOnClickListener { onThemeToggleClick?.invoke() }
         binding.btnSearch.setOnClickListener { onSearchClick?.invoke() }
-        binding.btnTranslateOriginal.setOnClickListener { onTranslationOriginalClick?.invoke() }
-        binding.btnTranslateTranslated.setOnClickListener { onTranslationTranslatedClick?.invoke() }
-        binding.btnTranslateBilingual.setOnClickListener { onTranslationBilingualClick?.invoke() }
+        binding.btnTranslateOriginal.setOnClickListener {
+            pendingTranslationMode = null
+            setTranslationMode(NovelReaderV3ViewModel.TranslationViewMode.Original)
+            onTranslationOriginalClick?.invoke()
+        }
+        binding.btnTranslateTranslated.setOnClickListener {
+            requestTranslationMode(NovelReaderV3ViewModel.TranslationViewMode.Translated)
+        }
+        binding.btnTranslateBilingual.setOnClickListener {
+            requestTranslationMode(NovelReaderV3ViewModel.TranslationViewMode.Bilingual)
+        }
 
         binding.skProgress.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar, progress: Int, fromUser: Boolean) {
@@ -61,6 +79,25 @@ class ReaderBottomBar(private val binding: LayoutReaderBottomBarBinding) {
                 }
             }
         })
+    }
+
+    private fun requestTranslationMode(mode: NovelReaderV3ViewModel.TranslationViewMode) {
+        // Give immediate visual feedback even when the novel is still being prepared.
+        setTranslationMode(mode)
+        if (translationReady) {
+            pendingTranslationMode = null
+            dispatchTranslationMode(mode)
+        } else {
+            pendingTranslationMode = mode
+        }
+    }
+
+    private fun dispatchTranslationMode(mode: NovelReaderV3ViewModel.TranslationViewMode) {
+        when (mode) {
+            NovelReaderV3ViewModel.TranslationViewMode.Original -> onTranslationOriginalClick?.invoke()
+            NovelReaderV3ViewModel.TranslationViewMode.Translated -> onTranslationTranslatedClick?.invoke()
+            NovelReaderV3ViewModel.TranslationViewMode.Bilingual -> onTranslationBilingualClick?.invoke()
+        }
     }
 
     fun setProgress(currentPage: Int, totalPages: Int) {
@@ -101,6 +138,7 @@ class ReaderBottomBar(private val binding: LayoutReaderBottomBarBinding) {
     }
 
     fun setTranslationProgress(done: Int, total: Int, running: Boolean) {
+        translationReady = total > 0
         if (total <= 0) {
             binding.txtTranslateProgress.visibility = View.GONE
             return
@@ -112,6 +150,14 @@ class ReaderBottomBar(private val binding: LayoutReaderBottomBarBinding) {
             total,
         )
         binding.txtTranslateProgress.alpha = if (running) 1f else 0.72f
+
+        // If the user selected 译文/对照 while loading, this is the first point where the
+        // paragraph set is known to be ready. Dispatch exactly once through the existing
+        // Fragment callback so translator selection/cache/progress behavior stays unchanged.
+        pendingTranslationMode?.let { pending ->
+            pendingTranslationMode = null
+            dispatchTranslationMode(pending)
+        }
     }
 
     fun setSeriesVisible(visible: Boolean) {

@@ -120,7 +120,7 @@ object NovelBatchTranslateCenter {
         currentKey = key
         val newJob = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                runBatch(novelId, title, targetLang, tokens, key)
+                runBatch(novelId, title, targetLang, tokens, key, generation)
             } catch (_: CancellationException) {
                 if (jobGeneration == generation) {
                     _status.value = _status.value?.copy(running = false)
@@ -150,9 +150,23 @@ object NovelBatchTranslateCenter {
         cancelKey(key(novelId, targetLang), showToast = true)
     }
 
-    private fun cancelKey(key: String, showToast: Boolean) {
-        if (job?.isActive != true || currentKey != key) return
-        job?.cancel()
+    private fun cancelKey(translationKey: String, showToast: Boolean) {
+        val oldJob = job
+        if (oldJob?.isActive != true || currentKey != translationKey) return
+
+        // Release the single active translation slot before cancelling the old coroutine.
+        // The old batch may spend noticeable time in NonCancellable while flushing completed
+        // paragraphs to disk; that cleanup must not block the next novel from starting.
+        ++jobGeneration
+        currentKey = null
+        job = null
+        _status.value?.let { status ->
+            if (key(status.novelId, status.targetLang) == translationKey) {
+                _status.value = status.copy(running = false)
+            }
+        }
+
+        oldJob.cancel()
         if (showToast) Common.showToast(R.string.novel_translate_cancelled)
     }
 
@@ -162,6 +176,7 @@ object NovelBatchTranslateCenter {
         targetLang: String,
         tokens: List<ContentToken>,
         key: String,
+        generation: Long,
     ) {
         val paragraphs = tokens.filterIsInstance<ContentToken.Paragraph>()
         val total = paragraphs.size
@@ -171,12 +186,16 @@ object NovelBatchTranslateCenter {
         val outputs = (cached ?: List(total) { "" }).toMutableList()
         val live = bucket(key)
         live.value = Snapshot(novelId, targetLang, outputs.toList(), total)
-        _status.value = BatchStatus(
-            novelId, title, targetLang, outputs.count { it.isNotBlank() }, total, running = true,
-        )
+        if (jobGeneration == generation) {
+            _status.value = BatchStatus(
+                novelId, title, targetLang, outputs.count { it.isNotBlank() }, total, running = true,
+            )
+        }
 
         if (total == 0 || outputs.all { it.isNotBlank() }) {
-            _status.value = _status.value?.copy(running = false, failed = 0)
+            if (jobGeneration == generation) {
+                _status.value = _status.value?.copy(running = false, failed = 0)
+            }
             return
         }
 
@@ -215,16 +234,18 @@ object NovelBatchTranslateCenter {
                         outputs[piece.paragraphIndex] = parts.joinToString("") { it.orEmpty() }
                         val snapshot = Snapshot(novelId, targetLang, outputs.toList(), total)
                         live.postValue(snapshot)
-                        _status.postValue(
-                            BatchStatus(
-                                novelId = novelId,
-                                title = title,
-                                targetLang = targetLang,
-                                done = snapshot.done,
-                                total = total,
-                                running = true,
+                        if (jobGeneration == generation) {
+                            _status.postValue(
+                                BatchStatus(
+                                    novelId = novelId,
+                                    title = title,
+                                    targetLang = targetLang,
+                                    done = snapshot.done,
+                                    total = total,
+                                    running = true,
+                                )
                             )
-                        )
+                        }
                         persistChannel.trySend(snapshot.translations)
                     }
                 },
@@ -237,7 +258,8 @@ object NovelBatchTranslateCenter {
         } finally {
             // The batch Job may already be cancelled here. Persist through a sibling process
             // scope and wait non-cancellably so leaving the reader or explicit stop still keeps
-            // every completed paragraph.
+            // every completed paragraph. The active slot is released before cancellation, so
+            // this disk cleanup never delays translation startup for the next novel.
             withContext(NonCancellable) {
                 persistChannel.trySend(outputs.toList())
                 persistChannel.close()
@@ -247,17 +269,19 @@ object NovelBatchTranslateCenter {
         }
 
         val failed = outputs.count { it.isBlank() }
-        _status.value = BatchStatus(
-            novelId = novelId,
-            title = title,
-            targetLang = targetLang,
-            done = outputs.count { it.isNotBlank() },
-            total = total,
-            running = false,
-            failed = failed,
-        )
-        if (requestFailure != null || failed > 0) {
-            Common.showToast(R.string.novel_translate_failed)
+        if (jobGeneration == generation) {
+            _status.value = BatchStatus(
+                novelId = novelId,
+                title = title,
+                targetLang = targetLang,
+                done = outputs.count { it.isNotBlank() },
+                total = total,
+                running = false,
+                failed = failed,
+            )
+            if (requestFailure != null || failed > 0) {
+                Common.showToast(R.string.novel_translate_failed)
+            }
         }
     }
 

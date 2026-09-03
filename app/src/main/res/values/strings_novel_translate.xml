@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
+<resources xmlns:tools="http://schemas.android.com/tools" tools:ignore="MissingTranslation">
     <string name="novel_translate_full">翻译全文</string>
     <string name="novel_translate_stop">停止翻译</string>
     <string name="novel_translate_view_original">原文</string>

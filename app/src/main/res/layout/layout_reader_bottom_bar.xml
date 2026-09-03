@@ -50,20 +50,66 @@
             app:tint="#FFFFFF" />
     </LinearLayout>
 
-    <!--
-        bottom row 权重不写死 weightSum：系列按钮 visibility=gone 时不参与权重，
-        其它 4 个按钮各占 1/4；系列按钮显示时 5 个按钮各占 1/5（自动收缩）。
-    -->
+    <LinearLayout
+        android:id="@+id/translate_mode_bar"
+        android:layout_width="match_parent"
+        android:layout_height="40dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingHorizontal="8dp">
+
+        <TextView
+            android:id="@+id/btn_translate_original"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="?attr/selectableItemBackground"
+            android:gravity="center"
+            android:text="@string/novel_translate_view_original"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/btn_translate_translated"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="?attr/selectableItemBackground"
+            android:gravity="center"
+            android:text="@string/novel_translate_view_translated"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/btn_translate_bilingual"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="?attr/selectableItemBackground"
+            android:gravity="center"
+            android:text="@string/novel_translate_view_bilingual"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp" />
+
+        <TextView
+            android:id="@+id/txt_translate_progress"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:gravity="center"
+            android:minWidth="88dp"
+            android:textColor="#CCFFFFFF"
+            android:textSize="11sp"
+            android:visibility="gone"
+            tools:text="已译 18/64 段"
+            tools:visibility="visible" />
+    </LinearLayout>
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="56dp"
         android:gravity="center_vertical"
         android:orientation="horizontal">
 
-        <!--
-            系列切换按钮：当前小说有所属系列时显示，唤起 SeriesListSheet 切换其它单篇。
-            见 ReaderBottomBar.setSeriesVisible / NovelReaderV3Fragment.showSeriesSheet。
-        -->
         <LinearLayout
             android:id="@+id/btn_series"
             android:layout_width="0dp"

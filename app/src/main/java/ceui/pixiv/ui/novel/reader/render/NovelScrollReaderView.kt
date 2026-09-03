@@ -303,23 +303,25 @@ class NovelScrollReaderView(context: Context) : RecyclerView(context) {
 
     private inner class ParagraphHolder(val tv: AppCompatTextView) : ViewHolder(tv) {
         private var boundSourceStart: Int = 0
+        private var boundSourceEnd: Int = 0
+        private var boundTranslated: Boolean = false
 
         init {
             tv.customSelectionActionModeCallback = object : ActionMode.Callback {
                 override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
                     populateMenu(menu)
-                    notifyTvSelection(tv, boundSourceStart, onSelectionStarted)
+                    notifyTvSelection(tv, boundSourceStart, boundSourceEnd, boundTranslated, onSelectionStarted)
                     return true
                 }
 
                 override fun onPrepareActionMode(mode: ActionMode, menu: Menu): Boolean {
                     populateMenu(menu)
-                    notifyTvSelection(tv, boundSourceStart, onSelectionChanged)
+                    notifyTvSelection(tv, boundSourceStart, boundSourceEnd, boundTranslated, onSelectionChanged)
                     return true
                 }
 
                 override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
-                    notifyTvSelection(tv, boundSourceStart, onSelectionChanged)
+                    notifyTvSelection(tv, boundSourceStart, boundSourceEnd, boundTranslated, onSelectionChanged)
                     onSelectionMenuAction?.invoke(item.itemId)
                     mode.finish()
                     return true
@@ -333,6 +335,15 @@ class NovelScrollReaderView(context: Context) : RecyclerView(context) {
 
         fun bind(token: ContentToken.Paragraph, style: TypeStyle, hits: List<HighlightRange>) {
             boundSourceStart = token.sourceStart
+            boundSourceEnd = token.sourceEnd
+            boundTranslated = token.isTranslated
+            val paragraphPaint = if (token.isSecondary) style.captionPaint else style.textPaint
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, paragraphPaint.textSize)
+            tv.typeface = paragraphPaint.typeface
+            tv.setTextColor(paragraphPaint.color)
+            tv.letterSpacing = paragraphPaint.letterSpacing
+            tv.setLineSpacing(style.lineSpacingExtra, style.lineSpacingMultiplier)
+
             val spannable = SpannableString(token.text)
             val indent = style.firstLineIndentPx.toInt()
             if (indent > 0 && token.text.isNotEmpty()) {
@@ -342,8 +353,6 @@ class NovelScrollReaderView(context: Context) : RecyclerView(context) {
                 )
             }
             applyInlineSpans(spannable, token.inlineSpans, style)
-            // LinkMovementMethod must be set BEFORE setTextIsSelectable,
-            // otherwise ArrowKeyMovementMethod overwrites it.
             tv.movementMethod = if (token.inlineSpans.any { it.tag is InlineTag.Link }) {
                 android.text.method.LinkMovementMethod.getInstance()
             } else {
@@ -358,7 +367,7 @@ class NovelScrollReaderView(context: Context) : RecyclerView(context) {
             val spannable = tv.text as? Spannable ?: return
             spannable.getSpans(0, spannable.length, ScrollSearchSpan::class.java)
                 .forEach { spannable.removeSpan(it) }
-            if (hits.isEmpty()) return
+            if (hits.isEmpty() || boundTranslated) return
             val anchorStart = boundSourceStart
             val anchorEnd = anchorStart + spannable.length
             for (hit in hits) {
@@ -576,6 +585,8 @@ class NovelScrollReaderView(context: Context) : RecyclerView(context) {
     private fun notifyTvSelection(
         tv: AppCompatTextView,
         sourceStart: Int,
+        sourceEnd: Int,
+        translated: Boolean,
         cb: ((Int, Int, String) -> Unit)?,
     ) {
         if (cb == null) return
@@ -583,7 +594,15 @@ class NovelScrollReaderView(context: Context) : RecyclerView(context) {
         val e = tv.selectionEnd.coerceAtLeast(s)
         if (e <= s || e > tv.text.length) return
         val sliced = tv.text.subSequence(s, e).toString()
-        cb(sourceStart + s, sourceStart + e, sliced)
+        if (!translated || tv.text.isEmpty()) {
+            cb(sourceStart + s, sourceStart + e, sliced)
+            return
+        }
+        val sourceLength = (sourceEnd - sourceStart).coerceAtLeast(0)
+        val displayLength = tv.text.length.coerceAtLeast(1)
+        val absStart = sourceStart + ((sourceLength.toLong() * s) / displayLength).toInt()
+        val absEnd = sourceStart + ((sourceLength.toLong() * e) / displayLength).toInt()
+        cb(absStart, absEnd, sliced)
     }
 
     // ---- Inline markup spans ------------------------------------------------

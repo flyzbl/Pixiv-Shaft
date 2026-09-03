@@ -83,11 +83,11 @@ android {
     testBuildType providers.gradleProperty('SHAFT_TEST_BUILD_TYPE').getOrElse('debug')
 
     defaultConfig {
-        applicationId "ceui.pixiv"
+        applicationId "ceui.pixiv.pshaft.novel"
         minSdkVersion 24
         targetSdkVersion 36
         versionCode 42500
-        versionName "4.9.2"
+        versionName "4.9.2-novel.1"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             // Production remains arm64-only. CI can request x86_64 so instrumented tests run on
@@ -167,8 +167,7 @@ android {
             // debug 也用正式 key（有的话）：跟历史行为一致，debug 包能覆盖安装旧 debug 包
             signingConfig hasShaftKeystore ? signingConfigs.shaft : signingConfigs.debug
 
-            applicationIdSuffix ".cshaft"
-            resValue "string", "app_name", "Shaft(Debug)"
+            resValue "string", "app_name", "Shaft 小说"
         }
         release {
             minifyEnabled true
@@ -178,8 +177,7 @@ android {
             testProguardFiles 'proguard-test-rules.pro'
             signingConfig hasShaftKeystore ? signingConfigs.shaft : signingConfigs.debug
 
-            applicationIdSuffix ".pshaft"
-            resValue "string", "app_name", "Shaft"
+            resValue "string", "app_name", "Shaft 小说"
         }
     }
 

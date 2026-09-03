@@ -205,19 +205,17 @@ class Paginator(
     private fun emitParagraph(token: ContentToken.Paragraph) {
         val width = geometry.contentWidth.toInt()
         if (width <= 0) return
+        val paragraphPaint = if (token.isSecondary) style.captionPaint else style.textPaint
         val indent = style.firstLineIndentPx.toInt()
         val source = if (indent > 0) TextMeasurer.withFirstLineIndent(token.text, indent) else token.text
         val layout = measurer.measure(
             text = source,
-            paint = style.textPaint,
+            paint = paragraphPaint,
             width = width,
             lineSpacingMultiplier = style.lineSpacingMultiplier,
             lineSpacingExtra = style.lineSpacingExtra,
         )
         val total = layout.lineCount
-        // Snapshot the slice data we need before advancing — the measurer's
-        // internal TextView is reused, so its `layout` becomes stale on the
-        // next emitParagraph() call.
         var cursor = 0
         while (cursor < total) {
             val remainingHeight = (geometry.height - geometry.paddingBottom) - currentY
@@ -226,10 +224,6 @@ class Paginator(
                 continue
             }
             val startTop = layout.getLineTop(cursor)
-            // Does even the *first* line fit? If not, flush the page and
-            // retry on a fresh one. The empty-page guard prevents an
-            // infinite loop in the pathological "font bigger than page"
-            // case — there we reluctantly accept a single overflowing line.
             val firstLineBottom = layout.getLineBottom(cursor).toFloat()
             val firstLineHeight = firstLineBottom - startTop
             if (firstLineHeight > remainingHeight && currentElements.isNotEmpty()) {
@@ -243,12 +237,7 @@ class Paginator(
                 if (pxIfIncluded > remainingHeight && linesFit > 0) break
                 linesFit = i - cursor + 1
                 pxUsed = pxIfIncluded
-                if (pxIfIncluded > remainingHeight) {
-                    // Reached only via the empty-page fallback above — a
-                    // single line that won't fit even on a blank page. Emit
-                    // anyway so we don't drop content.
-                    break
-                }
+                if (pxIfIncluded > remainingHeight) break
             }
             if (linesFit == 0) {
                 finishPage()
@@ -257,8 +246,8 @@ class Paginator(
 
             val startCharInLayout = layout.getLineStart(cursor).coerceIn(0, token.text.length)
             val endCharInLayout = layout.getLineEnd(cursor + linesFit - 1).coerceIn(0, token.text.length)
-            val absoluteStart = token.textSourceStart + startCharInLayout
-            val absoluteEnd = token.textSourceStart + endCharInLayout
+            val absoluteStart = sourceOffsetForDisplay(token, startCharInLayout)
+            val absoluteEnd = sourceOffsetForDisplay(token, endCharInLayout)
             val sliceText = token.text.substring(startCharInLayout, endCharInLayout)
 
             val element = PageElement.Text(
@@ -271,11 +260,12 @@ class Paginator(
                 isFirstLineOfParagraph = cursor == 0,
                 isLastLineOfParagraph = (cursor + linesFit) == total,
                 lineCount = linesFit,
+                isSecondary = token.isSecondary,
             )
             currentElements += element
             ensureStartTracked(absoluteStart)
             currentY += pxUsed
-            currentCharEnd = absoluteEnd
+            currentCharEnd = maxOf(currentCharEnd, absoluteEnd)
             cursor += linesFit
 
             if (cursor < total) {
@@ -284,6 +274,16 @@ class Paginator(
                 currentY += style.paragraphSpacingPx
             }
         }
+    }
+
+    private fun sourceOffsetForDisplay(token: ContentToken.Paragraph, displayOffset: Int): Int {
+        if (!token.isTranslated) {
+            return (token.textSourceStart + displayOffset).coerceIn(token.sourceStart, token.sourceEnd)
+        }
+        if (token.text.isEmpty()) return token.sourceStart
+        val span = (token.sourceEnd - token.sourceStart).coerceAtLeast(0)
+        val mapped = (span.toLong() * displayOffset.coerceIn(0, token.text.length)) / token.text.length
+        return (token.sourceStart + mapped.toInt()).coerceIn(token.sourceStart, token.sourceEnd)
     }
 
     private fun ensureStartTracked(start: Int) {

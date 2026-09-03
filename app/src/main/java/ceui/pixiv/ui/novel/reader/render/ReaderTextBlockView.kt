@@ -10,6 +10,7 @@ import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.AbsoluteSizeSpan
 import android.text.style.BackgroundColorSpan
+import android.text.style.ForegroundColorSpan
 import android.text.style.LeadingMarginSpan
 import android.text.style.LineHeightSpan
 import android.util.TypedValue
@@ -52,7 +53,12 @@ class ReaderTextBlockView(context: Context) : AppCompatTextView(context) {
      * — gaps between segments correspond to the paragraph separator chars
      * (`\n\n`) we insert when merging multiple paragraphs into a single view.
      */
-    private data class Segment(val localStart: Int, val localEnd: Int, val absoluteStart: Int)
+    private data class Segment(
+        val localStart: Int,
+        val localEnd: Int,
+        val absoluteStart: Int,
+        val absoluteEnd: Int,
+    )
     private val segments = mutableListOf<Segment>()
 
     /** Hook fired when the ActionMode is created for a fresh selection so the
@@ -112,16 +118,8 @@ class ReaderTextBlockView(context: Context) : AppCompatTextView(context) {
     fun bindTextGroup(elements: List<PageElement.Text>, style: TypeStyle) {
         segments.clear()
         val sb = SpannableStringBuilder()
-        // Precompute the uniform text-line height that both the paginator
-        // and this renderer will pin to. Gap lines get their own smaller
-        // height. Kept consistent with [TextMeasurer.wrapWithFixedLineHeight].
-        val fm = style.textPaint.fontMetrics
-        val naturalLineHeight = (fm.descent - fm.ascent).coerceAtLeast(1f)
-        val textLineHeight = (naturalLineHeight * style.lineSpacingMultiplier.coerceAtLeast(0.8f)
-            + style.lineSpacingExtra).roundToInt().coerceAtLeast(1)
         elements.forEachIndexed { idx, element ->
             val rawSlice = element.text.toString().trimEnd('\n')
-
             val segLocalStart = sb.length
             sb.append(rawSlice)
             val segLocalEnd = sb.length
@@ -129,6 +127,7 @@ class ReaderTextBlockView(context: Context) : AppCompatTextView(context) {
                 localStart = segLocalStart,
                 localEnd = segLocalEnd,
                 absoluteStart = element.absoluteCharStart,
+                absoluteEnd = element.absoluteCharEnd,
             )
 
             if (element.isFirstLineOfParagraph && style.firstLineIndentPx > 0f) {
@@ -137,22 +136,31 @@ class ReaderTextBlockView(context: Context) : AppCompatTextView(context) {
                     segLocalStart, segLocalEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
                 )
             }
-            // Pin every line of THIS paragraph's text to the uniform height
-            // BEFORE we move on — so the span is scoped to the element range
-            // and never touches the gap line below.
+
+            val elementPaint = if (element.isSecondary) style.captionPaint else style.textPaint
+            val fm = elementPaint.fontMetrics
+            val naturalLineHeight = (fm.descent - fm.ascent).coerceAtLeast(1f)
+            val textLineHeight = (
+                naturalLineHeight * style.lineSpacingMultiplier.coerceAtLeast(0.8f) + style.lineSpacingExtra
+            ).roundToInt().coerceAtLeast(1)
             if (segLocalEnd > segLocalStart) {
                 sb.setSpan(
                     TextMeasurer.FixedLineHeightSpan(textLineHeight),
                     segLocalStart, segLocalEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
                 )
+                if (element.isSecondary) {
+                    sb.setSpan(
+                        AbsoluteSizeSpan(style.captionPaint.textSize.roundToInt()),
+                        segLocalStart, segLocalEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                    )
+                    sb.setSpan(
+                        ForegroundColorSpan(style.secondaryTextColor),
+                        segLocalStart, segLocalEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                    )
+                }
             }
 
             if (idx < elements.size - 1) {
-                // Between paragraphs we emit `\n\u200B\n`: a terminating LF,
-                // a zero-width-space marker, and another LF. The ZWSP sits
-                // in its own single-line paragraph, so the line-height span
-                // below can target it without bleeding onto the surrounding
-                // text paragraphs.
                 val pixelGap = (elements[idx + 1].top - element.bottom).coerceAtLeast(0f).roundToInt()
                 sb.append('\n')
                 val gapLineStart = sb.length
@@ -160,14 +168,8 @@ class ReaderTextBlockView(context: Context) : AppCompatTextView(context) {
                 val gapLineEnd = sb.length
                 sb.append('\n')
                 if (pixelGap > 0) {
-                    sb.setSpan(
-                        AbsoluteSizeSpan(1),
-                        gapLineStart, gapLineEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
-                    )
-                    sb.setSpan(
-                        GapLineHeightSpan(pixelGap),
-                        gapLineStart, gapLineEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
-                    )
+                    sb.setSpan(AbsoluteSizeSpan(1), gapLineStart, gapLineEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    sb.setSpan(GapLineHeightSpan(pixelGap), gapLineStart, gapLineEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
             }
         }
@@ -175,9 +177,6 @@ class ReaderTextBlockView(context: Context) : AppCompatTextView(context) {
         typeface = style.textPaint.typeface
         setTextColor(style.textPaint.color)
         letterSpacing = style.textPaint.letterSpacing
-        // Line heights are driven entirely by the per-range FixedLineHeight
-        // and GapLineHeight spans above — reset setLineSpacing to a no-op
-        // so its (add, mult) path doesn't compound on top of them.
         setLineSpacing(0f, 1f)
         text = sb
         highlightColor = style.selectionColor
@@ -195,20 +194,24 @@ class ReaderTextBlockView(context: Context) : AppCompatTextView(context) {
         if (segments.isEmpty()) return
         for (hit in hits) {
             for (seg in segments) {
-                val segAbsEnd = seg.absoluteStart + (seg.localEnd - seg.localStart)
                 val s = maxOf(hit.absoluteStart, seg.absoluteStart)
-                val e = minOf(hit.absoluteEnd, segAbsEnd)
+                val e = minOf(hit.absoluteEnd, seg.absoluteEnd)
                 if (e <= s) continue
-                val localStart = seg.localStart + (s - seg.absoluteStart)
-                val localEnd = seg.localStart + (e - seg.absoluteStart)
-                t.setSpan(
-                    SearchHighlightSpan(hit.color),
-                    localStart, localEnd,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
-                )
+                val localStart = absoluteToLocal(seg, s)
+                val localEnd = absoluteToLocal(seg, e)
+                if (localEnd <= localStart) continue
+                t.setSpan(SearchHighlightSpan(hit.color), localStart, localEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
         }
         invalidate()
+    }
+
+    private fun absoluteToLocal(seg: Segment, absoluteOffset: Int): Int {
+        val localLength = seg.localEnd - seg.localStart
+        val absoluteLength = seg.absoluteEnd - seg.absoluteStart
+        if (localLength <= 0 || absoluteLength <= 0) return seg.localStart
+        val rel = (absoluteOffset - seg.absoluteStart).coerceIn(0, absoluteLength)
+        return seg.localStart + ((localLength.toLong() * rel) / absoluteLength).toInt()
     }
 
     /** Marker subclass so we can find-and-remove our own overlay spans on
@@ -224,12 +227,14 @@ class ReaderTextBlockView(context: Context) : AppCompatTextView(context) {
         if (segments.isEmpty()) return 0
         for (seg in segments) {
             if (localOffset <= seg.localEnd) {
-                val clamped = localOffset.coerceAtLeast(seg.localStart)
-                return seg.absoluteStart + (clamped - seg.localStart)
+                val localLength = seg.localEnd - seg.localStart
+                val absoluteLength = seg.absoluteEnd - seg.absoluteStart
+                if (localLength <= 0 || absoluteLength <= 0) return seg.absoluteStart
+                val rel = localOffset.coerceIn(seg.localStart, seg.localEnd) - seg.localStart
+                return seg.absoluteStart + ((absoluteLength.toLong() * rel) / localLength).toInt()
             }
         }
-        val last = segments.last()
-        return last.absoluteStart + (last.localEnd - last.localStart)
+        return segments.last().absoluteEnd
     }
 
     private fun buildActionModeCallback(): ActionMode.Callback {

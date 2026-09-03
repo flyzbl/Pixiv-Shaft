@@ -54,7 +54,10 @@ import ceui.pixiv.ui.novel.reader.render.NovelReaderView
 import ceui.pixiv.ui.novel.reader.render.NovelScrollReaderView
 import ceui.pixiv.ui.novel.reader.render.ReaderTextBlockView
 import ceui.pixiv.ui.novel.reader.render.PageOverlays
+import ceui.pixiv.ui.translate.NovelBatchTranslateCenter
 import ceui.pixiv.ui.translate.appTranslateTargetLang
+import ceui.pixiv.ui.translate.currentTranslator
+import ceui.pixiv.ui.translate.showTranslatedDialog
 import ceui.pixiv.ui.novel.reader.settings.ReaderSettings
 import ceui.pixiv.ui.novel.reader.settings.ReaderTheme
 import ceui.pixiv.ui.novel.reader.ui.AnnotationSheetCallback
@@ -111,6 +114,8 @@ class NovelReaderV3Fragment : Fragment(R.layout.fragment_novel_reader_v3),
     private var chrome: ReaderChrome? = null
     /** 常驻阅读进度当前读数（形如 "43%"），随翻页/滚动刷新。 */
     private var progressOverlayText: String = ""
+    private var translationBound = false
+    private var latestTranslationSnapshot: NovelBatchTranslateCenter.Snapshot? = null
 
     private var searchRegex: Boolean = false
     private var activeSelection: TextSelection? = null
@@ -282,6 +287,9 @@ class NovelReaderV3Fragment : Fragment(R.layout.fragment_novel_reader_v3),
         bb.onScrollSeekCommit = { fraction ->
             scrollReaderView?.takeIf { it.visibility == View.VISIBLE }?.scrollToFraction(fraction)
         }
+        bb.onTranslationOriginalClick = { setTranslationViewMode(NovelReaderV3ViewModel.TranslationViewMode.Original) }
+        bb.onTranslationTranslatedClick = { setTranslationViewMode(NovelReaderV3ViewModel.TranslationViewMode.Translated) }
+        bb.onTranslationBilingualClick = { setTranslationViewMode(NovelReaderV3ViewModel.TranslationViewMode.Bilingual) }
     }
 
     private fun wireSearchOverlay(so: ReaderSearchOverlay, chrome: ReaderChrome) {
@@ -457,6 +465,7 @@ class NovelReaderV3Fragment : Fragment(R.layout.fragment_novel_reader_v3),
                 val seriesId = state.novel?.series?.id
                 bb.setSeriesVisible(seriesId != null)
                 loadWatchlistStateForSeries(seriesId)
+                bindNovelTranslation(state, bb)
                 pushStyleAndGeometryIfReady()
                 rebindScrollViewIfActive()
             }
@@ -500,6 +509,12 @@ class NovelReaderV3Fragment : Fragment(R.layout.fragment_novel_reader_v3),
             if ((version ?: 0) > 0) rebindScrollViewIfActive()
         }
 
+        viewModel.displayVersion.observe(viewLifecycleOwner) { version ->
+            if ((version ?: 0) > 0) rebindScrollViewIfActive()
+        }
+
+        NovelBatchTranslateCenter.status.observe(viewLifecycleOwner) { refreshTranslationProgress(bb) }
+
         viewModel.annotations.observe(viewLifecycleOwner) { list ->
             annotationSpans = list.map { a ->
                 HighlightSpan(
@@ -519,6 +534,53 @@ class NovelReaderV3Fragment : Fragment(R.layout.fragment_novel_reader_v3),
         }
 
         bb.setDarkMode(currentThemeIsDark())
+        bb.setTranslationMode(viewModel.currentTranslationViewMode())
+    }
+
+    private fun bindNovelTranslation(loaded: NovelReaderV3ViewModel.LoadState.Loaded, bb: ReaderBottomBar) {
+        if (translationBound) return
+        translationBound = true
+        val targetLang = appTranslateTargetLang()
+        NovelBatchTranslateCenter.translationsOf(viewModel.novelId, targetLang).observe(viewLifecycleOwner) { snapshot ->
+            latestTranslationSnapshot = snapshot
+            if (snapshot != null) viewModel.updateNovelTranslations(snapshot.translations)
+            refreshTranslationProgress(bb)
+        }
+        NovelBatchTranslateCenter.prepare(viewModel.novelId, loaded.tokens, targetLang)
+    }
+
+    private fun setTranslationViewMode(mode: NovelReaderV3ViewModel.TranslationViewMode) {
+        viewModel.setTranslationViewMode(mode)
+        bottomBar?.setTranslationMode(mode)
+        if (mode != NovelReaderV3ViewModel.TranslationViewMode.Original) {
+            val snapshot = latestTranslationSnapshot
+            if (snapshot == null || snapshot.done < snapshot.total) startNovelTranslation()
+        }
+    }
+
+    private fun startNovelTranslation() {
+        val loaded = viewModel.loadState.value as? NovelReaderV3ViewModel.LoadState.Loaded ?: run {
+            Toaster.showShort(R.string.msg_novel_not_ready)
+            return
+        }
+        val targetLang = appTranslateTargetLang()
+        if (NovelBatchTranslateCenter.isRunningFor(viewModel.novelId, targetLang)) return
+        val title = loaded.novel?.title ?: loaded.webNovel.title.orEmpty()
+        if (!NovelBatchTranslateCenter.start(viewModel.novelId, title, loaded.tokens)) {
+            Toaster.showShort(R.string.novel_translate_busy)
+        }
+    }
+
+    private fun refreshTranslationProgress(bb: ReaderBottomBar) {
+        val targetLang = appTranslateTargetLang()
+        val status = NovelBatchTranslateCenter.status.value
+            ?.takeIf { it.novelId == viewModel.novelId && it.targetLang == targetLang }
+        val snapshot = latestTranslationSnapshot
+        bb.setTranslationProgress(
+            done = status?.done ?: snapshot?.done ?: 0,
+            total = status?.total ?: snapshot?.total ?: 0,
+            running = status?.running == true,
+        )
     }
 
     // ---- Actions ------------------------------------------------------------
@@ -767,6 +829,15 @@ class NovelReaderV3Fragment : Fragment(R.layout.fragment_novel_reader_v3),
 
     /** 阅读器自身的菜单项（书签 / 保存位置 / 追更 / 导出），由 [showTopMoreMenu] 两个分支共用。 */
     private fun V3MenuBuilder.addReaderMenuItems() {
+        val targetLang = appTranslateTargetLang()
+        val translating = NovelBatchTranslateCenter.isRunningFor(viewModel.novelId, targetLang)
+        item(
+            getString(if (translating) R.string.novel_translate_stop else R.string.novel_translate_full),
+            R.drawable.ic_baseline_translate_24,
+        ) {
+            if (translating) NovelBatchTranslateCenter.cancel(viewModel.novelId, targetLang)
+            else startNovelTranslation()
+        }
         item(getString(R.string.menu_bookmarks), R.drawable.ic_baseline_bookmark_24) {
             showBookmarksSheet()
         }
@@ -1171,13 +1242,41 @@ class NovelReaderV3Fragment : Fragment(R.layout.fragment_novel_reader_v3),
     }
 
     private fun translateSelection() {
-        val sel = activeSelection ?: return
-        val intent = Intent(Intent.ACTION_PROCESS_TEXT).apply { type = "text/plain"; putExtra(Intent.EXTRA_PROCESS_TEXT, sel.text); putExtra(Intent.EXTRA_PROCESS_TEXT_READONLY, true) }
+        val source = activeSelection?.text?.trim().orEmpty()
+        if (source.isEmpty()) return
+        val ctx = requireContext()
+        Toaster.showShort(R.string.string_translating)
+        viewLifecycleOwner.lifecycleScope.launch {
+            val translated = try {
+                currentTranslator().translate(source, appTranslateTargetLang())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Timber.w(e, "novel selection in-app translation failed; fallback to PROCESS_TEXT")
+                null
+            }
+            if (!translated.isNullOrBlank()) {
+                showTranslatedDialog(ctx, translated)
+                return@launch
+            }
+            launchExternalTranslation(source)
+        }
+    }
+
+    private fun launchExternalTranslation(text: String) {
+        val intent = Intent(Intent.ACTION_PROCESS_TEXT).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_PROCESS_TEXT, text)
+            putExtra(Intent.EXTRA_PROCESS_TEXT_READONLY, true)
+        }
         if (intent.resolveActivity(requireContext().packageManager) != null) {
             startActivity(Intent.createChooser(intent, getString(R.string.chooser_translate)))
         } else {
-            runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://translate.google.com/?sl=auto&tl=${appTranslateTargetLang()}&text=${Uri.encode(sel.text)}&op=translate"))) }
-                .onFailure { Toaster.showShort(getString(R.string.msg_no_translate_app)) }
+            runCatching {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(
+                    "https://translate.google.com/?sl=auto&tl=${appTranslateTargetLang()}&text=${Uri.encode(text)}&op=translate"
+                )))
+            }.onFailure { Toaster.showShort(getString(R.string.msg_no_translate_app)) }
         }
     }
 

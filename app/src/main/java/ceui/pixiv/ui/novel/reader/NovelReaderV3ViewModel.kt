@@ -39,6 +39,7 @@ import ceui.pixiv.ui.novel.reader.model.SearchHit
 import ceui.pixiv.ui.novel.reader.paginate.ChapterOutlineEntry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.android.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -51,6 +52,8 @@ class NovelReaderV3ViewModel(
     private val localUri: String? = null,
     private val localTitle: String? = null,
 ) : ViewModel() {
+
+    enum class TranslationViewMode { Original, Translated, Bilingual }
 
     /** 本地 txt 源：非空时 [load] 走离线分支，不碰网络 / ObjectPool。 */
     val isLocal: Boolean get() = !localUri.isNullOrEmpty()
@@ -131,6 +134,12 @@ class NovelReaderV3ViewModel(
     /** 取材拉到手后 +1，阅读页 observe 它来重绑纵向滚动视图（横向由内部 repaginate 覆盖）。 */
     private val _illustMixVersion = MutableLiveData(0)
     val illustMixVersion: LiveData<Int> = _illustMixVersion
+
+    private var translationViewMode = TranslationViewMode.Original
+    private var translatedParagraphs: List<String> = emptyList()
+    private var translationRefreshJob: Job? = null
+    private val _displayVersion = MutableLiveData(0)
+    val displayVersion: LiveData<Int> = _displayVersion
 
     private var pendingStyle: TypeStyle? = null
     private var pendingGeometry: PageGeometry? = null
@@ -217,9 +226,71 @@ class NovelReaderV3ViewModel(
      */
     fun displayTokens(): List<ContentToken> {
         val source = ReaderSettings.illustMixSource
-        if (source == NovelIllustSource.None) return tokens
-        if (mixIllustsSource != source || mixIllusts.isEmpty()) return tokens
-        return IllustMixInserter.insert(tokens, mixIllusts.map { it.id })
+        val base = if (source == NovelIllustSource.None || mixIllustsSource != source || mixIllusts.isEmpty()) {
+            tokens
+        } else {
+            IllustMixInserter.insert(tokens, mixIllusts.map { it.id })
+        }
+        if (translationViewMode == TranslationViewMode.Original || translatedParagraphs.isEmpty()) return base
+
+        val result = ArrayList<ContentToken>(if (translationViewMode == TranslationViewMode.Bilingual) base.size * 2 else base.size)
+        var paragraphIndex = 0
+        for (token in base) {
+            if (token !is ContentToken.Paragraph) {
+                result += token
+                continue
+            }
+            val translated = translatedParagraphs.getOrNull(paragraphIndex).orEmpty()
+            paragraphIndex++
+            if (translated.isBlank()) {
+                result += token
+                continue
+            }
+            val translatedToken = token.copy(
+                text = translated,
+                textSourceStart = token.sourceStart,
+                inlineSpans = emptyList(),
+                isTranslated = true,
+                isSecondary = false,
+            )
+            when (translationViewMode) {
+                TranslationViewMode.Original -> result += token
+                TranslationViewMode.Translated -> result += translatedToken
+                TranslationViewMode.Bilingual -> {
+                    result += translatedToken
+                    result += token.copy(isSecondary = true)
+                }
+            }
+        }
+        return result
+    }
+
+    fun currentTranslationViewMode(): TranslationViewMode = translationViewMode
+
+    fun setTranslationViewMode(mode: TranslationViewMode) {
+        if (translationViewMode == mode) return
+        translationViewMode = mode
+        refreshTranslatedDisplay(immediate = true)
+    }
+
+    fun updateNovelTranslations(translations: List<String>) {
+        if (translatedParagraphs == translations) return
+        translatedParagraphs = translations.toList()
+        if (translationViewMode != TranslationViewMode.Original) refreshTranslatedDisplay(immediate = false)
+    }
+
+    private fun refreshTranslatedDisplay(immediate: Boolean) {
+        translationRefreshJob?.cancel()
+        if (immediate) {
+            repaginateIfReady()
+            _displayVersion.value = (_displayVersion.value ?: 0) + 1
+            return
+        }
+        translationRefreshJob = viewModelScope.launch {
+            delay(250)
+            repaginateIfReady()
+            _displayVersion.value = (_displayVersion.value ?: 0) + 1
+        }
     }
 
     /** 内嵌插图照旧走 webNovel 的对象表，查不到再落到混排取材的 URL 表。 */
@@ -620,6 +691,7 @@ class NovelReaderV3ViewModel(
     override fun onCleared() {
         super.onCleared()
         paginationJob?.cancel()
+        translationRefreshJob?.cancel()
         paginationThread.quitSafely()
     }
 

@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import timber.log.Timber
@@ -154,6 +155,16 @@ object NovelBatchTranslateCenter {
             }
         }
 
+        // A single IO writer serializes cache updates. The conflated channel keeps only the
+        // newest pending snapshot when translation is faster than disk, so long novels persist
+        // incremental progress without an unbounded write queue or stale-write races.
+        val persistChannel = Channel<List<String>>(Channel.CONFLATED)
+        val persistJob = scope.launch(Dispatchers.IO) {
+            for (pending in persistChannel) {
+                NovelTranslateCache.save(novelId, targetLang, tokens, pending)
+            }
+        }
+
         var requestFailure: Exception? = null
         try {
             currentTranslator().translateBatch(
@@ -178,6 +189,7 @@ object NovelBatchTranslateCenter {
                                 running = true,
                             )
                         )
+                        persistChannel.trySend(snapshot.translations)
                     }
                 },
             )
@@ -187,8 +199,12 @@ object NovelBatchTranslateCenter {
             requestFailure = e
             Timber.e(e, "NovelBatchTranslateCenter: translateBatch failed")
         } finally {
-            withContext(NonCancellable + Dispatchers.IO) {
-                NovelTranslateCache.save(novelId, targetLang, tokens, outputs)
+            // The batch Job may already be cancelled here. Persist through a sibling process
+            // scope and wait non-cancellably so explicit stop still keeps every completed paragraph.
+            withContext(NonCancellable) {
+                persistChannel.trySend(outputs.toList())
+                persistChannel.close()
+                persistJob.join()
             }
             live.postValue(Snapshot(novelId, targetLang, outputs.toList(), total))
         }

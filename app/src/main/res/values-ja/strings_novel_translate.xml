@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="novel_translate_full">全文を翻訳</string>
+    <string name="novel_translate_stop">翻訳を停止</string>
+    <string name="novel_translate_view_original">原文</string>
+    <string name="novel_translate_view_translated">訳文</string>
+    <string name="novel_translate_view_bilingual">対訳</string>
+    <string name="novel_translate_progress">%1$d/%2$d 段落を翻訳済み</string>
+    <string name="novel_translate_failed">小説の翻訳に失敗しました。未完了の段落を再試行できます。</string>
+    <string name="novel_translate_cancelled">翻訳を停止しました。後で続行できます。</string>
+    <string name="novel_translate_busy">別の小説を翻訳中です。</string>
+</resources>

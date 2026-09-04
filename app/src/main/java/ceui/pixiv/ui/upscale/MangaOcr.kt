@@ -1,15 +1,8 @@
 package ceui.pixiv.ui.upscale
 
-import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.Paint
-import android.graphics.Path
-import android.os.Build
-import android.provider.MediaStore
-import ceui.lisa.BuildConfig
 import ceui.lisa.R
 import ceui.pixiv.ui.translate.ComicTextDetector
 import ceui.pixiv.ui.translate.DetectionBox
@@ -21,7 +14,6 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import java.io.File
-import java.io.FileOutputStream
 import kotlin.coroutines.coroutineContext
 
 /**
@@ -106,9 +98,8 @@ object MangaOcr {
     private const val MIN_RECOG_CONFIDENCE = 0.3f
 
     /**
-     * manga-ocr 在真气泡识别完后,常在末尾多吐一个括号字 hallucinate(实测「フォルネウス王子〉」「ヴァネッサ様!?〈」)。
-     * 这些字符不会作为合法日文句末出现,**recognize 完直接 trim**。
-     * 注意:不能 trim 全部 punctuation,!? 是合法句末。只 trim 真的不该出现的尾巴字符。
+     * manga-ocr 在真气泡识别完后,常在末尾多吐一个括号字 hallucinate。
+     * 这些字符不会作为合法日文句末出现,recognize 完直接 trim。
      */
     private val TRAILING_NOISE_CHARS = setOf(
         '〈', '〉', '《', '》', '「', '」', '『', '』', '【', '】',
@@ -118,11 +109,7 @@ object MangaOcr {
 
     /**
      * Recognize text in a manga page.
-     *
      * Pipeline: comic-text-detector (气泡级 AABB) → manga-ocr (ViT+GPT2) 重识别。
-     * 调用前必须把 [models] 加载好([MangaTranslateModels.ensureLoaded]),否则返回 null。
-     *
-     * Progress 阶段: "检测文本框" 0→0.3,"识别 i/N" 0.3→1.0。
      */
     suspend fun recognize(
         context: Context,
@@ -130,8 +117,6 @@ object MangaOcr {
         inputFile: File,
         onProgress: ((stage: String, fraction: Float) -> Unit)? = null
     ): MangaOcrResult? = withContext(Dispatchers.IO) {
-        // 整段 OCR 是秒级阻塞工作,必须在这里逐段检查取消,否则页面销毁后
-        // 气泡检测 + 逐框识别会整段跑完才返回,「工作流无法中断」就出在这一层
         coroutineContext.ensureActive()
         if (!models.ocr.isLoaded) {
             Timber.e("MangaOcr: manga-ocr model not loaded")
@@ -143,7 +128,6 @@ object MangaOcr {
         }
         var bitmap: Bitmap? = null
         try {
-            // 先 inJustDecodeBounds 测原图,大图通过 inSampleSize 降采样防 OOM
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(inputFile.absolutePath, bounds)
             val origShort = minOf(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
@@ -160,7 +144,9 @@ object MangaOcr {
                 return@withContext null
             }
             coroutineContext.ensureActive()
-            Timber.d("MangaOcr: orig ${bounds.outWidth}x${bounds.outHeight} sample=$sample → ${bitmap!!.width}x${bitmap!!.height}")
+            Timber.d(
+                "MangaOcr: orig ${bounds.outWidth}x${bounds.outHeight} sample=$sample → ${bitmap!!.width}x${bitmap!!.height}"
+            )
 
             // 检测阶段没有可靠百分比 → 用 NaN 通知 caller 切 indeterminate ring
             onProgress?.invoke(context.getString(R.string.string_ai_ocr_detecting), Float.NaN)
@@ -169,13 +155,12 @@ object MangaOcr {
             val detResult = models.detector.detect(bitmap!!)
             coroutineContext.ensureActive()
             val rawRegions = detResult.boxes.map { it.toOcrTextRegion() }
-            Timber.d("MangaOcr: CTD returned ${rawRegions.size} regions, mask=${detResult.textMask?.let { "${it.width}x${it.height}" } ?: "null"}")
+            Timber.d(
+                "MangaOcr: CTD returned ${rawRegions.size} regions, mask=${detResult.textMask?.let { "${it.width}x${it.height}" } ?: "null"}"
+            )
 
-            // debug 图只在 debug build 走相册落盘 — release 不能给用户相册塞调试 PNG
-            if (BuildConfig.DEBUG) {
-                saveDetectionDebugImage(context, bitmap!!, rawRegions)
-            }
-
+            // 不把 OCR/CTD 的中间调试图写入 MediaStore 或任何相册目录。
+            // 检测框只作为内存中的 region 数据继续传给 OCR 和翻译回填。
             val minShort = minRegionShortSide(minOf(bitmap!!.width, bitmap!!.height))
             val viableRegions = rawRegions.filter { r ->
                 val short = minOf(r.width, r.height)
@@ -188,7 +173,6 @@ object MangaOcr {
 
             val total = viableRegions.size
             val enhanced = viableRegions.mapIndexedNotNull { idx, region ->
-                // 逐 region 检查取消:一页常有几十个气泡,不能让取消憋到全部识别完
                 coroutineContext.ensureActive()
                 onProgress?.invoke(
                     context.getString(R.string.string_ai_ocr_recognizing, idx + 1, total),
@@ -207,7 +191,6 @@ object MangaOcr {
                     if (trimmed.isBlank()) null
                     else region.copy(text = trimmed, recogConfidence = result.confidence)
                 } catch (e: CancellationException) {
-                    // 页面销毁取消:必须重抛,不能被当成「该 region 识别失败」吞掉继续跑
                     throw e
                 } catch (e: Exception) {
                     Timber.e(e, "MangaOcr: manga-ocr failed for region, dropping")
@@ -220,10 +203,10 @@ object MangaOcr {
             onProgress?.invoke(context.getString(R.string.string_ai_ocr_done), 1f)
 
             val confident = enhanced.filter { it.recogConfidence >= MIN_RECOG_CONFIDENCE }
-            Timber.d("MangaOcr: ${enhanced.size} → ${confident.size} after recog-confidence filter (>=$MIN_RECOG_CONFIDENCE)")
+            Timber.d(
+                "MangaOcr: ${enhanced.size} → ${confident.size} after recog-confidence filter (>=$MIN_RECOG_CONFIDENCE)"
+            )
 
-            // 坐标系归一:CTD/recognize 是在 sample 后 bitmap 上跑的,这里乘回 sample
-            // 把 region 转成"原图分辨率"坐标,下游(渲染/回填)统一基于原图坐标处理。
             val finalRegions = confident
                 .filter { it.isMeaningfulJapanese() }
                 .let { mangaReadingOrder(it) }
@@ -235,9 +218,12 @@ object MangaOcr {
                     finalRegions.size, sample, sample0.cx, sample0.cy, sample0.width, sample0.height
                 )
             }
-            MangaOcrResult(regions = finalRegions, textMask = detResult.textMask, ocrSample = sample)
+            MangaOcrResult(
+                regions = finalRegions,
+                textMask = detResult.textMask,
+                ocrSample = sample,
+            )
         } catch (e: CancellationException) {
-            // 取消不是 OCR 失败:重抛给上层按「翻译取消」处理,别记成 error 日志
             throw e
         } catch (e: Exception) {
             Timber.e(e, "MangaOcr error")
@@ -247,20 +233,12 @@ object MangaOcr {
         }
     }
 
-    /**
-     * 把 CTD 输出转成 [OcrTextRegion]。
-     * - text 占位空串,manga-ocr 后续重识别覆盖
-     * - orientation 启发式:明显竖长(高 > 宽*1.2)→ 竖排;否则横排
-     *   (方形 / 略竖长 一律横排 — 翻译多为中文,横排显示更自然;此前默认竖排导致
-     *    短促对白如"やった!"→"做到了!"被强排成单列细窄文字,与气泡框对不齐)
-     * - corners 用 AABB 四角(TL→TR→BR→BL),供 TextRenderer / TextEraser 使用
-     */
+    /** 把 CTD 输出转成 OcrTextRegion。 */
     private fun DetectionBox.toOcrTextRegion(): OcrTextRegion {
         val left = cx - width / 2f
         val top = cy - height / 2f
         val right = cx + width / 2f
         val bottom = cy + height / 2f
-        // 0=horizontal(默认 + 略竖长), 1=vertical(明显竖长)
         val orient = if (height > width * 1.2f) 1 else 0
         return OcrTextRegion(
             text = "",
@@ -289,71 +267,10 @@ object MangaOcr {
     }
 
     /**
-     * Debug only: 把检测阶段所有 raw region 的 quad 用纯红填到原图副本上,
-     * Q+ 走 MediaStore 落到 Pictures/Pixiv-Shaft-OCR/ 让相册直接看到;
-     * <Q fallback externalCacheDir(老机器没用相册的简便办法)。失败不影响主管线。
-     */
-    private fun saveDetectionDebugImage(
-        context: Context,
-        source: Bitmap,
-        regions: List<OcrTextRegion>,
-    ) {
-        var debug: Bitmap? = null
-        try {
-            debug = source.copy(Bitmap.Config.ARGB_8888, true) ?: return
-            val canvas = Canvas(debug)
-            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = 0xFFFF0000.toInt()
-                style = Paint.Style.FILL
-            }
-            for (r in regions) {
-                val pts = r.corners
-                if (pts.size < 4) continue
-                val path = Path().apply {
-                    moveTo(pts[0].first, pts[0].second)
-                    for (i in 1 until pts.size) lineTo(pts[i].first, pts[i].second)
-                    close()
-                }
-                canvas.drawPath(path, paint)
-            }
-            val name = "ocr_debug_boxes_${System.currentTimeMillis()}.png"
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Images.Media.DISPLAY_NAME, name)
-                    put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Pixiv-Shaft-OCR")
-                }
-                val uri = context.contentResolver.insert(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
-                )
-                if (uri != null) {
-                    context.contentResolver.openOutputStream(uri)?.use { out ->
-                        debug.compress(Bitmap.CompressFormat.PNG, 100, out)
-                    }
-                    Timber.d("MangaOcr: detection debug image saved → Pictures/Pixiv-Shaft-OCR/$name (${regions.size} boxes)")
-                } else {
-                    Timber.w("MangaOcr: MediaStore insert returned null, debug image not saved")
-                }
-            } else {
-                val dir = context.externalCacheDir ?: context.cacheDir
-                val outFile = File(dir, name)
-                FileOutputStream(outFile).use { out ->
-                    debug.compress(Bitmap.CompressFormat.PNG, 100, out)
-                }
-                Timber.d("MangaOcr: detection debug image saved → ${outFile.absolutePath} (${regions.size} boxes)")
-            }
-        } catch (e: Exception) {
-            Timber.w(e, "MangaOcr: failed to save detection debug image (non-fatal)")
-        } finally {
-            debug?.recycle()
-        }
-    }
-
-    /**
      * 合法日文 region 判据:
-     *   - 含至少一个日文/汉字字符
-     *   - 去掉省略号/括号/标点后,实际字符数 >= 2
-     *     或 == 1 且 (detection prob >= 0.85 **且** manga-ocr 自身 conf >= 0.85)
+     * - 含至少一个日文/汉字字符
+     * - 去掉省略号/括号/标点后,实际字符数 >= 2
+     * - 或 == 1 且 detection 和 recognition 置信都 >= 0.85
      */
     private fun OcrTextRegion.isMeaningfulJapanese(): Boolean {
         val coreChars = text.count { it !in PUNCTUATION_TO_IGNORE }
@@ -372,10 +289,7 @@ object MangaOcr {
         return coreChars >= 2 || (prob >= 0.85f && recogConfidence >= 0.85f)
     }
 
-    /**
-     * 阅读顺序:cy 升序贪心分 row(下一个 region 的 cy 落在当前 row 累计纵向区间内就并入,
-     * 否则开新 row),每个 row 内按 cx 右→左。
-     */
+    /** 阅读顺序:先按行从上到下,每行内从右到左。 */
     private fun mangaReadingOrder(regions: List<OcrTextRegion>): List<OcrTextRegion> {
         if (regions.size <= 1) return regions
         val byCy = regions.sortedBy { it.cy }

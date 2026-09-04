@@ -8,6 +8,7 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.Observer
 import ceui.lisa.R
 import ceui.lisa.utils.Common
+import ceui.pixiv.ui.novel.reader.ReaderProgressStore
 import ceui.pixiv.ui.novel.reader.model.ContentToken
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -27,6 +28,12 @@ import timber.log.Timber
  * Translation survives ordinary configuration while the reader view exists, but when the
  * reader view lifecycle is destroyed (the user leaves that novel), the matching batch is
  * cancelled silently. Completed paragraphs are persisted and can be resumed next time.
+ *
+ * Scheduling is reader-first rather than book-first: when a batch starts, the persisted reading
+ * char index is used as an anchor. Untranslated paragraphs at/after that position are translated
+ * before earlier paragraphs. A small priority batch around the anchor is completed first so the
+ * text the user is looking at can appear quickly; only then does the normal high-throughput batch
+ * process the rest of the novel.
  */
 object NovelBatchTranslateCenter {
 
@@ -67,6 +74,14 @@ object NovelBatchTranslateCenter {
     }
 
     private const val MAX_PIECE_CHARS = 2800
+
+    /**
+     * First request budget around the current reading position. This is deliberately well below
+     * AiTranslator's normal 3000-char batch size: the goal here is time-to-first-visible-
+     * translation, not aggregate throughput. Whole paragraphs are kept intact; an unusually long
+     * paragraph may therefore exceed this budget rather than being displayed partially.
+     */
+    private const val PRIORITY_BATCH_CHARS = 1200
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val buckets = LinkedHashMap<String, TranslationLiveData>()
@@ -199,16 +214,41 @@ object NovelBatchTranslateCenter {
             return
         }
 
-        val pieces = ArrayList<Piece>()
+        // ReaderProgressStore is already updated by both paged and vertical reader paths. Use the
+        // same source-of-truth here instead of maintaining a second current-page state just for
+        // translation. In gaps between tokens we bias forward, matching normal reading direction.
+        val readingChar = ReaderProgressStore.loadCharIndex(novelId)
+        val paragraphOrder = priorityParagraphOrder(paragraphs, outputs, readingChar)
+
+        val piecesByParagraph = arrayOfNulls<List<Piece>>(total)
         val pieceResults = Array(total) { mutableListOf<String?>() }
-        for ((paragraphIndex, paragraph) in paragraphs.withIndex()) {
-            if (outputs[paragraphIndex].isNotBlank()) continue
+        for (paragraphIndex in paragraphOrder) {
+            val paragraph = paragraphs[paragraphIndex]
             val split = splitParagraph(paragraph.text)
             pieceResults[paragraphIndex].addAll(List(split.size) { null })
-            split.forEachIndexed { pieceIndex, text ->
-                pieces += Piece(paragraphIndex, pieceIndex, text)
+            piecesByParagraph[paragraphIndex] = split.mapIndexed { pieceIndex, text ->
+                Piece(paragraphIndex, pieceIndex, text)
             }
         }
+
+        val priorityParagraphCount = priorityParagraphCount(
+            paragraphOrder = paragraphOrder,
+            paragraphs = paragraphs,
+            charBudget = PRIORITY_BATCH_CHARS,
+        )
+        val priorityPieces = paragraphOrder.take(priorityParagraphCount)
+            .flatMap { piecesByParagraph[it].orEmpty() }
+        val remainingPieces = paragraphOrder.drop(priorityParagraphCount)
+            .flatMap { piecesByParagraph[it].orEmpty() }
+
+        Timber.d(
+            "NovelBatchTranslateCenter: priority anchor=%d paragraph=%s firstBatchParagraphs=%d firstBatchChars=%d remainingPieces=%d",
+            readingChar,
+            paragraphOrder.firstOrNull()?.toString() ?: "none",
+            priorityParagraphCount,
+            priorityPieces.sumOf { it.text.length },
+            remainingPieces.size,
+        )
 
         // A single IO writer serializes cache updates. The conflated channel keeps only the
         // newest pending snapshot when translation is faster than disk, so long novels persist
@@ -220,9 +260,12 @@ object NovelBatchTranslateCenter {
             }
         }
 
+        val translator = currentTranslator()
         var requestFailure: Exception? = null
-        try {
-            currentTranslator().translateBatch(
+
+        suspend fun translatePieces(pieces: List<Piece>) {
+            if (pieces.isEmpty()) return
+            translator.translateBatch(
                 inputs = pieces.map { it.text },
                 outputLang = targetLang,
                 onItem = { flatIndex, translated ->
@@ -250,6 +293,18 @@ object NovelBatchTranslateCenter {
                     }
                 },
             )
+        }
+
+        try {
+            // Stage 1: finish the paragraph(s) around the current reading position first. Because
+            // this call contains only ~1200 chars in normal prose, AiTranslator creates one small
+            // request instead of immediately filling all four normal batch lanes.
+            translatePieces(priorityPieces)
+
+            // Stage 2: once the visible neighborhood has been published, restore normal batching
+            // and concurrency for the rest of the book. Order remains forward-from-current first,
+            // then wraps around to fill untranslated paragraphs before the reading position.
+            translatePieces(remainingPieces)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -283,6 +338,53 @@ object NovelBatchTranslateCenter {
                 Common.showToast(R.string.novel_translate_failed)
             }
         }
+    }
+
+    /**
+     * Returns untranslated paragraph indices in reading-priority order:
+     * the paragraph at/after [readingChar], then everything after it, then earlier paragraphs.
+     * Earlier content is filled from nearest to farthest so a small backwards jump is more likely
+     * to hit cache than the very beginning of the book.
+     */
+    internal fun priorityParagraphOrder(
+        paragraphs: List<ContentToken.Paragraph>,
+        outputs: List<String>,
+        readingChar: Int,
+    ): List<Int> {
+        if (paragraphs.isEmpty()) return emptyList()
+        val anchorIndex = when {
+            readingChar <= paragraphs.first().sourceStart -> 0
+            else -> paragraphs.indexOfFirst { readingChar <= it.sourceEnd }
+                .takeIf { it >= 0 }
+                ?: paragraphs.lastIndex
+        }
+        return buildList {
+            for (i in anchorIndex..paragraphs.lastIndex) {
+                if (outputs.getOrNull(i).isNullOrBlank()) add(i)
+            }
+            for (i in anchorIndex - 1 downTo 0) {
+                if (outputs.getOrNull(i).isNullOrBlank()) add(i)
+            }
+        }
+    }
+
+    /** Keep whole paragraphs together in the latency-sensitive first request. */
+    internal fun priorityParagraphCount(
+        paragraphOrder: List<Int>,
+        paragraphs: List<ContentToken.Paragraph>,
+        charBudget: Int = PRIORITY_BATCH_CHARS,
+    ): Int {
+        if (paragraphOrder.isEmpty()) return 0
+        var chars = 0
+        var count = 0
+        for (paragraphIndex in paragraphOrder) {
+            val length = paragraphs.getOrNull(paragraphIndex)?.text?.length ?: continue
+            if (count > 0 && chars + length > charBudget) break
+            chars += length
+            count++
+            if (chars >= charBudget) break
+        }
+        return count.coerceAtLeast(1)
     }
 
     internal fun splitParagraph(text: String, limit: Int = MAX_PIECE_CHARS): List<String> {
